@@ -68,7 +68,7 @@ class NvidiaClient:
     def __init__(self, settings: NvidiaSettings):
         self.settings = settings
         self.base_url = settings.base_url.rstrip("/")
-        self.api_key = settings.api_key
+        self.api_key = settings.api_key or "missing"
         self.timeout = settings.timeout_seconds
         self._sdk_client = OpenAI(
             base_url=self.base_url,

@@ -1,49 +1,61 @@
-# Service API
+# Service API Reference
+
+## Authentication
+
+When authentication is enabled (`NVIDIA_BRIDGE_AUTH_ENABLED=true`), include the API key in every request:
+
+```
+X-Bridge-API-Key: nvbridge-your-key-here
+```
+
+Endpoints `/health` and `/metrics` are always accessible without authentication.
 
 ## `GET /health`
 
-Returns service status, whether `NVIDIA_API_KEY` is present, the masked key, and the configured NVIDIA base URL.
-
-Example:
+Returns service status and feature flags.
 
 ```json
 {
   "status": "ok",
   "service": "Nvidia Model Bridge",
+  "version": "2.0.0",
   "api_key_found": true,
   "api_key_masked": "nvapi-****abcd",
-  "base_url": "https://integrate.api.nvidia.com/v1"
+  "base_url": "https://integrate.api.nvidia.com/v1",
+  "auth_enabled": false,
+  "cache_enabled": true,
+  "streaming_enabled": true,
+  "metrics_enabled": true,
+  "uptime_seconds": 3600.0
 }
 ```
 
-If the key is missing, the service reports `degraded`.
+## `GET /health/deep`
 
-## `GET /models/priority`
+Deep health check that verifies NVIDIA API connectivity, cache status, and circuit breakers.
 
-Returns the three priority models as editable model records.
-
-## `GET /models/recommended`
-
-Returns the current benchmark-backed routing map:
-
-- default/general: `qwen/qwen3-next-80b-a3b-instruct`
-- reasoning: `qwen/qwen3-next-80b-a3b-instruct`
-- nvidia reasoning: `nvidia/nemotron-3-nano-omni-30b-a3b-reasoning`
-- coding: `qwen/qwen3-next-80b-a3b-instruct`
-- fast: `nvidia/nemotron-mini-4b-instruct`
-- fallback: `mistralai/mistral-nemotron`
-- lightweight: `openai/gpt-oss-20b`
-- deepseek: `deepseek-ai/deepseek-v4-pro`
-
-## `GET /models/avoid`
-
-Returns avoid, partial, and retest candidate lists.
+```json
+{
+  "status": "ok",
+  "service": "Nvidia Model Bridge",
+  "version": "2.0.0",
+  "api_key_found": true,
+  "base_url": "https://integrate.api.nvidia.com/v1",
+  "nvidia_reachable": true,
+  "nvidia_status_code": 200,
+  "nvidia_latency_seconds": 0.45,
+  "nvidia_models_found": 121,
+  "cache_stats": {"size": 42, "hits": 150, "misses": 30, "hit_rate": 0.8333},
+  "circuit_breaker_summary": {"open_circuits": [], "total_tracked": 5},
+  "auth_enabled": false
+}
+```
 
 ## `POST /ask`
 
-Coordinator routing endpoint.
+Coordinator routing endpoint with intelligent model selection.
 
-Request example:
+### Request
 
 ```json
 {
@@ -53,19 +65,16 @@ Request example:
   "temperature": null,
   "top_p": null,
   "max_tokens": null,
-  "stream": false
+  "stream": false,
+  "system_prompt": null,
+  "conversation_history": [
+    {"role": "user", "content": "Previous question"},
+    {"role": "assistant", "content": "Previous answer"}
+  ]
 }
 ```
 
-Behavior:
-
-- If `model` is supplied, the gateway uses that exact model.
-- If `model` is missing, the coordinator chooses a model from the task type.
-- If `task_type` is missing, the gateway uses `general`.
-- If the coordinator-selected model fails, it tries one fallback model.
-- If a user-specified model fails, it returns a clear error instead of silently switching models.
-
-Example response:
+### Response
 
 ```json
 {
@@ -78,19 +87,96 @@ Example response:
   "latency_seconds": 1.23,
   "content": "...",
   "reasoning": null,
-  "error": null
+  "error": null,
+  "request_id": "550e8400-e29b-41d4-a716-446655440000",
+  "cache_hit": false
 }
 ```
 
 ## `POST /v1/chat/completions`
 
-OpenAI-compatible forwarding endpoint.
+OpenAI-compatible forwarding endpoint. Supports streaming.
 
-Rules:
+### Non-Streaming
 
-- `model` is required.
-- If `model` is missing, the service returns HTTP `400` with an `invalid_request_error`.
-- If `stream=true`, the service returns HTTP `400` with an `unsupported_feature` error.
-- The request is forwarded to NVIDIA’s `POST https://integrate.api.nvidia.com/v1/chat/completions` endpoint using the exact model provided.
+```json
+{
+  "model": "qwen/qwen3-next-80b-a3b-instruct",
+  "messages": [{"role": "user", "content": "Hello"}],
+  "temperature": 0.7,
+  "max_tokens": 1024,
+  "stream": false
+}
+```
 
-Use `/ask` when you want routing. Use `/v1/chat/completions` when you want exact OpenAI-compatible forwarding.
+### Streaming (SSE)
+
+Set `"stream": true` to receive Server-Sent Events.
+
+## `POST /jobs/submit`
+
+Submit a long-running request as an async job.
+
+### Request
+
+```json
+{
+  "prompt": "Solve this complex problem...",
+  "task_type": "reasoning",
+  "model": null,
+  "system_prompt": null
+}
+```
+
+### Response
+
+```json
+{
+  "job_id": "550e8400-e29b-41d4-a716-446655440000",
+  "status": "pending",
+  "message": "Job submitted successfully. Poll /jobs/{job_id} for status."
+}
+```
+
+## `GET /jobs/{job_id}`
+
+Get job status. Returns result when completed.
+
+## `GET /analytics/dashboard?hours=24`
+
+Returns usage analytics for the specified time window.
+
+## `GET /cache/stats`
+
+Returns cache hit rate, size, and configuration.
+
+## `POST /cache/invalidate?model_id=model/name`
+
+Invalidate cache entries. Omit `model_id` to clear all.
+
+## `GET /circuit-breakers`
+
+Returns circuit breaker state for all tracked models.
+
+## `POST /circuit-breakers/reset?model_id=model/name`
+
+Reset a circuit breaker. Omit `model_id` to reset all.
+
+## `GET /templates`
+
+Returns available system prompt templates and their content.
+
+## Error Responses
+
+All errors follow this format:
+
+```json
+{
+  "error": {
+    "message": "Description of the error.",
+    "type": "error_type"
+  }
+}
+```
+
+Error types: `authentication_error`, `rate_limit_error`, `validation_error`, `invalid_request_error`, `unsupported_feature`, `not_found`.

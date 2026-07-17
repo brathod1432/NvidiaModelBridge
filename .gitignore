@@ -11,3 +11,11 @@ _temp_nvidia_diagnostics/
 audits/*.json
 audits/*.md
 !audits/.gitkeep
+
+# Database
+data/
+*.db
+
+# Coverage
+htmlcov/
+.coverage

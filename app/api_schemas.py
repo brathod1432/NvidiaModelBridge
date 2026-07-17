@@ -20,6 +20,8 @@ class AskRequest(BaseModel):
     top_p: float | None = None
     max_tokens: int | None = None
     stream: bool = False
+    system_prompt: str | None = None
+    conversation_history: list[ChatMessage] | None = None
 
 
 class AskResponse(BaseModel):
@@ -33,6 +35,8 @@ class AskResponse(BaseModel):
     content: str | None = None
     reasoning: str | None = None
     error: str | None = None
+    request_id: str | None = None
+    cache_hit: bool = False
 
 
 class ChatCompletionRequest(BaseModel):
@@ -48,9 +52,31 @@ class ChatCompletionRequest(BaseModel):
 class HealthResponse(BaseModel):
     status: str
     service: str
+    version: str = "2.0.0"
     api_key_found: bool
     api_key_masked: str
     base_url: str
+    auth_enabled: bool = False
+    cache_enabled: bool = False
+    streaming_enabled: bool = False
+    metrics_enabled: bool = False
+    uptime_seconds: float | None = None
+
+
+class DeepHealthResponse(BaseModel):
+    status: str
+    service: str
+    version: str = "2.0.0"
+    api_key_found: bool
+    base_url: str
+    nvidia_reachable: bool = False
+    nvidia_status_code: int | None = None
+    nvidia_latency_seconds: float | None = None
+    nvidia_models_found: int = 0
+    cache_stats: dict[str, Any] = Field(default_factory=dict)
+    circuit_breaker_summary: dict[str, Any] = Field(default_factory=dict)
+    auth_enabled: bool = False
+    rate_limit_stats: dict[str, Any] = Field(default_factory=dict)
 
 
 class ModelResponse(BaseModel):
@@ -82,3 +108,32 @@ class ModelListResponse(BaseModel):
 
 class ErrorEnvelope(BaseModel):
     error: dict[str, Any]
+
+
+class JobSubmitRequest(BaseModel):
+    prompt: str
+    task_type: str | None = None
+    model: str | None = None
+    temperature: float | None = None
+    top_p: float | None = None
+    max_tokens: int | None = None
+    system_prompt: str | None = None
+
+
+class JobSubmitResponse(BaseModel):
+    job_id: str
+    status: str
+    message: str
+
+
+class JobStatusResponse(BaseModel):
+    id: str
+    status: str
+    created_at: float
+    started_at: float | None = None
+    completed_at: float | None = None
+    elapsed_seconds: float | None = None
+    progress: str = ""
+    has_result: bool = False
+    error: str | None = None
+    result: dict[str, Any] | None = None

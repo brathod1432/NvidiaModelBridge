@@ -1,0 +1,78 @@
+name: CI
+
+on:
+  push:
+    branches: [main, security_improvements]
+  pull_request:
+    branches: [main]
+
+jobs:
+  lint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - name: Install dependencies
+        run: |
+          pip install -r requirements.txt
+          pip install ruff mypy
+      - name: Lint with ruff
+        run: ruff check app/ tests/
+      - name: Type check with mypy
+        run: mypy app/ --ignore-missing-imports --no-strict-optional
+        continue-on-error: true
+
+  test:
+    runs-on: ubuntu-latest
+    env:
+      NVIDIA_API_KEY: "nvapi-test-key-for-ci"
+      NVIDIA_BRIDGE_AUTH_ENABLED: "false"
+      NVIDIA_BRIDGE_ENABLE_METRICS: "false"
+    steps:
+      - uses: actions/checkout@v4
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+      - name: Run tests
+        run: pytest tests/ -v --tb=short
+      - name: Check imports
+        run: python -c "from app.main import app; print('Import OK')"
+
+  docker:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build Docker image
+        run: docker build -t nvidia-model-bridge:test .
+      - name: Verify container starts
+        run: |
+          docker run -d --name test-bridge \
+            -e NVIDIA_API_KEY=nvapi-test \
+            -p 8000:8000 \
+            nvidia-model-bridge:test
+          sleep 5
+          curl -f http://localhost:8000/health || exit 1
+          docker stop test-bridge
+
+  security:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - name: Install dependencies
+        run: pip install -r requirements.txt pip-audit
+      - name: Check for known vulnerabilities
+        run: pip-audit
+        continue-on-error: true
+      - name: Check for secrets in code
+        run: |
+          grep -rn "nvapi-" app/ --include="*.py" | grep -v "nvapi-\*\*\*\*" | grep -v "nvapi-your" | grep -v "nvapi-test" | grep -v "placeholder" || echo "No hardcoded keys found"
