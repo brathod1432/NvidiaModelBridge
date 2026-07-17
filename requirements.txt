@@ -1,11 +1,44 @@
-openai
-python-dotenv
-pydantic
-pydantic-settings
-httpx
-requests
-tenacity
-rich
-pytest
-fastapi
-uvicorn
+# Core framework
+fastapi>=0.115.0
+uvicorn>=0.30.0
+pydantic>=2.10.0
+pydantic-settings>=2.7.0
+python-dotenv>=1.0.0
+
+# HTTP clients
+httpx>=0.27.0
+openai>=1.50.0
+requests>=2.32.0
+
+# Retry logic
+tenacity>=9.0.0
+
+# Console output
+rich>=14.0.0
+
+# Streaming (SSE)
+sse-starlette>=2.0.0
+
+# Caching
+cachetools>=5.5.0
+
+# Structured logging
+structlog>=24.0.0
+
+# Metrics
+prometheus-client>=0.21.0
+prometheus-fastapi-instrumentator>=7.0.0
+
+# Rate limiting
+slowapi>=0.1.9
+
+# Database
+aiosqlite>=0.19.0
+
+# Testing
+pytest>=8.0.0
+pytest-asyncio>=0.23.0
+httpx>=0.27.0
+
+# ASGI
+starlette>=0.40.0

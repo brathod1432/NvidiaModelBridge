@@ -314,10 +314,39 @@ class BridgeSettings:
     api_key_injected_for_run: bool = False
     api_key_injection_note: str = ""
 
+    # Security settings
+    cors_origins: tuple[str, ...] = ("*",)
+    auth_enabled: bool = False
+    rate_limit_per_minute: int = 60
+    rate_limit_window: int = 60
+    max_prompt_length: int = 100_000
+    max_message_count: int = 100
+
+    # Infrastructure settings
+    enable_cache: bool = True
+    cache_maxsize: int = 1000
+    cache_ttl: int = 300
+    circuit_breaker_threshold: int = 5
+    circuit_breaker_recovery: float = 60.0
+    enable_metrics: bool = True
+    enable_request_logging: bool = True
+    log_level: str = "INFO"
+    log_json: bool = False
+
+    # Feature flags
+    enable_streaming: bool = True
+    enable_system_prompts: bool = True
+    enable_analytics: bool = True
+    enable_job_queue: bool = True
+
     @classmethod
     def load(cls) -> "BridgeSettings":
         resolution = resolve_nvidia_api_key()
         api_key = str(resolution["api_key"] or "")
+
+        cors_raw = _load_env_value("NVIDIA_BRIDGE_CORS_ORIGINS", "*")
+        cors_origins = tuple(o.strip() for o in cors_raw.split(",") if o.strip())
+
         return cls(
             api_key=api_key,
             api_key_source=str(resolution["api_key_source"]),
@@ -340,6 +369,54 @@ class BridgeSettings:
             loaded_env_files=tuple(str(path) for path in resolution["loaded_env_files"]),
             api_key_injected_for_run=bool(resolution["injected_for_run"]),
             api_key_injection_note=str(resolution["injection_note"]),
+            # Security
+            cors_origins=cors_origins,
+            auth_enabled=_parse_bool(os.getenv("NVIDIA_BRIDGE_AUTH_ENABLED"), False),
+            rate_limit_per_minute=_parse_int(
+                os.getenv("NVIDIA_BRIDGE_RATE_LIMIT"), 60
+            ),
+            rate_limit_window=_parse_int(
+                os.getenv("NVIDIA_BRIDGE_RATE_WINDOW"), 60
+            ),
+            max_prompt_length=_parse_int(
+                os.getenv("NVIDIA_BRIDGE_MAX_PROMPT_LENGTH"), 100_000
+            ),
+            max_message_count=_parse_int(
+                os.getenv("NVIDIA_BRIDGE_MAX_MESSAGE_COUNT"), 100
+            ),
+            # Infrastructure
+            enable_cache=_parse_bool(os.getenv("NVIDIA_BRIDGE_ENABLE_CACHE"), True),
+            cache_maxsize=_parse_int(
+                os.getenv("NVIDIA_BRIDGE_CACHE_MAXSIZE"), 1000
+            ),
+            cache_ttl=_parse_int(os.getenv("NVIDIA_BRIDGE_CACHE_TTL"), 300),
+            circuit_breaker_threshold=_parse_int(
+                os.getenv("NVIDIA_BRIDGE_CB_THRESHOLD"), 5
+            ),
+            circuit_breaker_recovery=float(
+                _parse_int(os.getenv("NVIDIA_BRIDGE_CB_RECOVERY"), 60)
+            ),
+            enable_metrics=_parse_bool(
+                os.getenv("NVIDIA_BRIDGE_ENABLE_METRICS"), True
+            ),
+            enable_request_logging=_parse_bool(
+                os.getenv("NVIDIA_BRIDGE_ENABLE_REQUEST_LOG"), True
+            ),
+            log_level=_load_env_value("NVIDIA_BRIDGE_LOG_LEVEL", "INFO").upper(),
+            log_json=_parse_bool(os.getenv("NVIDIA_BRIDGE_LOG_JSON"), False),
+            # Features
+            enable_streaming=_parse_bool(
+                os.getenv("NVIDIA_BRIDGE_ENABLE_STREAMING"), True
+            ),
+            enable_system_prompts=_parse_bool(
+                os.getenv("NVIDIA_BRIDGE_ENABLE_SYSTEM_PROMPTS"), True
+            ),
+            enable_analytics=_parse_bool(
+                os.getenv("NVIDIA_BRIDGE_ENABLE_ANALYTICS"), True
+            ),
+            enable_job_queue=_parse_bool(
+                os.getenv("NVIDIA_BRIDGE_ENABLE_JOB_QUEUE"), True
+            ),
         )
 
     @property
