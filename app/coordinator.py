@@ -2,20 +2,26 @@
 
 from __future__ import annotations
 
+import asyncio
 import time
 from dataclasses import dataclass
 from typing import Any
 
+from app.analytics import get_analytics_collector
+from app.cache import get_response_cache
+from app.circuit_breaker import get_circuit_breaker_registry
 from app.config import BridgeSettings
+from app.metrics import record_fallback, record_model_request
 from app.model_registry import ModelEntry, get_model_by_id
 from app.model_router import (
+    fallback_candidates_for,
     get_available_model_ids,
-    get_fallback_model_id,
     get_model_record,
     is_model_available,
     select_model,
 )
 from app.nvidia_client import NvidiaClient
+from app.prompt_templates import build_messages_with_system_prompt
 
 
 UNSUPPORTED_STREAMING_ERROR = "Streaming is not supported yet by Nvidia Model Bridge."
@@ -36,6 +42,7 @@ class CoordinatorOutcome:
     selected_model: str | None = None
     fallback_model: str | None = None
     metadata: dict[str, Any] | None = None
+    cache_hit: bool = False
 
     def to_api_response(self) -> dict[str, Any]:
         return {
@@ -49,6 +56,7 @@ class CoordinatorOutcome:
             "content": self.content,
             "reasoning": self.reasoning,
             "error": self.error,
+            "cache_hit": self.cache_hit,
         }
 
 
@@ -62,6 +70,15 @@ class Coordinator:
         self.client = client or NvidiaClient(
             settings=_benchmark_settings_for_gateway(self.settings)
         )
+        self._cache = get_response_cache(
+            maxsize=self.settings.cache_maxsize,
+            ttl=self.settings.cache_ttl,
+        )
+        self._circuit_breakers = get_circuit_breaker_registry(
+            failure_threshold=self.settings.circuit_breaker_threshold,
+            recovery_timeout=self.settings.circuit_breaker_recovery,
+        )
+        self._analytics = get_analytics_collector()
 
     def ask(
         self,
@@ -72,6 +89,8 @@ class Coordinator:
         top_p: float | None,
         max_tokens: int | None,
         stream: bool,
+        system_prompt: str | None = None,
+        conversation_history: list[dict[str, str]] | None = None,
     ) -> CoordinatorOutcome:
         started_at = time.perf_counter()
         if stream:
@@ -106,47 +125,180 @@ class Coordinator:
                 selected_model=selection.model_id,
             )
 
+        # Build messages with system prompt and conversation history
+        effective_task = selection.task_type
+        if self.settings.enable_system_prompts:
+            messages = build_messages_with_system_prompt(
+                prompt=prompt,
+                task_type=effective_task,
+                system_prompt_override=system_prompt,
+                conversation_history=conversation_history,
+            )
+        else:
+            messages = []
+            if conversation_history:
+                messages.extend(conversation_history)
+            messages.append({"role": "user", "content": prompt})
+
+        # Check cache
+        if self.settings.enable_cache:
+            cached = self._cache.get(
+                model_id=selection.model_id,
+                messages=messages,
+                temperature=temperature,
+                max_tokens=max_tokens,
+            )
+            if cached is not None:
+                self._analytics.record(
+                    model_id=selection.model_id,
+                    task_type=effective_task,
+                    success=True,
+                    latency_seconds=round(time.perf_counter() - started_at, 4),
+                    cache_hit=True,
+                    endpoint="/ask",
+                )
+                return CoordinatorOutcome(
+                    success=True,
+                    model=selection.model_id,
+                    task_type=effective_task,
+                    selected_by=selection.selected_by,
+                    selection_reason=selection.selection_reason,
+                    fallback_used=False,
+                    latency_seconds=round(time.perf_counter() - started_at, 4),
+                    content=cached.get("content", ""),
+                    reasoning=cached.get("reasoning"),
+                    error=None,
+                    selected_model=selection.model_id,
+                    cache_hit=True,
+                )
+
+        # Check circuit breaker
+        if not self._circuit_breakers.is_model_available(selection.model_id):
+            # Model circuit is open, go directly to fallback
+            if not selection.user_specified:
+                fallback_outcome = self._try_fallbacks(
+                    selection=selection,
+                    messages=messages,
+                    temperature=temperature,
+                    top_p=top_p,
+                    max_tokens=max_tokens,
+                    started_at=started_at,
+                    primary_error=f"Circuit breaker open for {selection.model_id}.",
+                )
+                if fallback_outcome:
+                    return fallback_outcome
+
+            return self._failure_outcome(
+                selection=selection,
+                started_at=started_at,
+                model_id=selection.model_id,
+                error=f"Model {selection.model_id} circuit breaker is open (too many recent failures).",
+            )
+
+        # Try primary model
         selected_record = get_model_record(selection.model_id) or get_model_by_id(
             selection.model_id
         )
         primary_result = self._call_model(
             model_id=selection.model_id,
-            prompt=prompt,
+            messages=messages,
             record=selected_record,
             temperature=temperature,
             top_p=top_p,
             max_tokens=max_tokens,
         )
+
         if primary_result["success"]:
-            return self._success_outcome(
+            self._circuit_breakers.record_success(selection.model_id)
+            outcome = self._success_outcome(
                 selection=selection,
                 result=primary_result,
                 started_at=started_at,
                 selected_model=selection.model_id,
                 fallback_used=False,
             )
+            # Cache successful response
+            if self.settings.enable_cache:
+                self._cache.put(
+                    model_id=selection.model_id,
+                    messages=messages,
+                    response={
+                        "content": outcome.content,
+                        "reasoning": outcome.reasoning,
+                    },
+                    temperature=temperature,
+                    max_tokens=max_tokens,
+                )
+            self._record_analytics(selection, outcome)
+            return outcome
+
+        # Primary failed
+        self._circuit_breakers.record_failure(selection.model_id)
 
         if selection.user_specified:
-            return self._failure_outcome(
+            outcome = self._failure_outcome(
                 selection=selection,
                 started_at=started_at,
                 model_id=selection.model_id,
                 error=primary_result.get("error_message") or "Model request failed.",
             )
+            self._record_analytics(selection, outcome)
+            return outcome
 
-        fallback_model_id = get_fallback_model_id(selection.model_id)
-        if fallback_model_id and is_model_available(fallback_model_id):
+        # Try fallback chain
+        fallback_outcome = self._try_fallbacks(
+            selection=selection,
+            messages=messages,
+            temperature=temperature,
+            top_p=top_p,
+            max_tokens=max_tokens,
+            started_at=started_at,
+            primary_error=primary_result.get("error_message") or "request failed.",
+        )
+        if fallback_outcome:
+            return fallback_outcome
+
+        outcome = self._failure_outcome(
+            selection=selection,
+            started_at=started_at,
+            model_id=selection.model_id,
+            error=primary_result.get("error_message") or "Model request failed.",
+        )
+        self._record_analytics(selection, outcome)
+        return outcome
+
+    def _try_fallbacks(
+        self,
+        *,
+        selection,
+        messages: list[dict[str, str]],
+        temperature: float | None,
+        top_p: float | None,
+        max_tokens: int | None,
+        started_at: float,
+        primary_error: str,
+    ) -> CoordinatorOutcome | None:
+        """Try all available fallback candidates in order."""
+        candidates = fallback_candidates_for(selection.model_id)
+        for fallback_model_id in candidates:
+            if not is_model_available(fallback_model_id):
+                continue
+            if not self._circuit_breakers.is_model_available(fallback_model_id):
+                continue
+
             fallback_record = get_model_record(fallback_model_id)
             fallback_result = self._call_model(
                 model_id=fallback_model_id,
-                prompt=prompt,
+                messages=messages,
                 record=fallback_record,
                 temperature=temperature,
                 top_p=top_p,
                 max_tokens=max_tokens,
             )
             if fallback_result["success"]:
-                return self._success_outcome(
+                self._circuit_breakers.record_success(fallback_model_id)
+                record_fallback(selection.model_id, fallback_model_id)
+                outcome = self._success_outcome(
                     selection=selection,
                     result=fallback_result,
                     started_at=started_at,
@@ -154,33 +306,30 @@ class Coordinator:
                     fallback_used=True,
                     fallback_model=fallback_model_id,
                 )
+                # Cache the fallback response too
+                if self.settings.enable_cache:
+                    self._cache.put(
+                        model_id=selection.model_id,
+                        messages=messages,
+                        response={
+                            "content": outcome.content,
+                            "reasoning": outcome.reasoning,
+                        },
+                        temperature=temperature,
+                        max_tokens=max_tokens,
+                    )
+                self._record_analytics(selection, outcome)
+                return outcome
+            else:
+                self._circuit_breakers.record_failure(fallback_model_id)
 
-            return self._failure_outcome(
-                selection=selection,
-                started_at=started_at,
-                model_id=selection.model_id,
-                error=(
-                    f"Primary model {selection.model_id} failed: "
-                    f"{primary_result.get('error_message') or 'request failed.'} "
-                    f"Fallback model {fallback_model_id} also failed: "
-                    f"{fallback_result.get('error_message') or 'request failed.'}"
-                ),
-                fallback_used=True,
-                fallback_model=fallback_model_id,
-            )
-
-        return self._failure_outcome(
-            selection=selection,
-            started_at=started_at,
-            model_id=selection.model_id,
-            error=primary_result.get("error_message") or "Model request failed.",
-        )
+        return None
 
     def _call_model(
         self,
         *,
         model_id: str,
-        prompt: str,
+        messages: list[dict[str, str]],
         record: ModelEntry | None,
         temperature: float | None,
         top_p: float | None,
@@ -195,12 +344,29 @@ class Coordinator:
         )
         return self.client.chat_completion_http(
             model_id=model_id,
-            messages=[{"role": "user", "content": prompt}],
+            messages=messages,
             temperature=default_temperature,
             top_p=default_top_p,
             max_tokens=default_max_tokens,
             extra_body=record.extra_body if record else None,
             stream=False,
+        )
+
+    def _record_analytics(self, selection, outcome: CoordinatorOutcome) -> None:
+        record_model_request(
+            model_id=outcome.model or "",
+            task_type=outcome.task_type,
+            success=outcome.success,
+            latency=outcome.latency_seconds,
+        )
+        self._analytics.record(
+            model_id=outcome.model or "",
+            task_type=outcome.task_type,
+            success=outcome.success,
+            latency_seconds=outcome.latency_seconds or 0,
+            fallback_used=outcome.fallback_used,
+            cache_hit=outcome.cache_hit,
+            endpoint="/ask",
         )
 
     def _success_outcome(
