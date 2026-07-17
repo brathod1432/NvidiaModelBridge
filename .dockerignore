@@ -1,0 +1,11 @@
+.env
+.env.*
+.git
+.gitignore
+.idea
+.pytest_cache
+__pycache__
+*.pyc
+_temp_nvidia_diagnostics
+audits/*.json
+audits/*.md
