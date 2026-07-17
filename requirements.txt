@@ -1,0 +1,11 @@
+openai
+python-dotenv
+pydantic
+pydantic-settings
+httpx
+requests
+tenacity
+rich
+pytest
+fastapi
+uvicorn

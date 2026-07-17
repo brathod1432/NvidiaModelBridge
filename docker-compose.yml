@@ -1,0 +1,16 @@
+services:
+  nvidia-model-bridge:
+    build: .
+    container_name: nvidia-model-bridge
+    ports:
+      - "8000:8000"
+    environment:
+      - NVIDIA_API_KEY=${NVIDIA_API_KEY}
+      - NVIDIA_BASE_URL=https://integrate.api.nvidia.com/v1
+      - NVIDIA_MODEL_BRIDGE_HOST=0.0.0.0
+      - NVIDIA_MODEL_BRIDGE_PORT=8000
+      - NVIDIA_SERVICE_TIMEOUT_SECONDS=90
+    volumes:
+      - ./audits:/app/audits
+      - ./docs:/app/docs
+    restart: unless-stopped
