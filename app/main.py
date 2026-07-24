@@ -14,6 +14,9 @@ from app.analytics import get_analytics_collector
 from app.api_schemas import (
     AskRequest,
     AskResponse,
+    BatchRequest,
+    BatchResponse,
+    BatchResponseItem,
     ChatCompletionRequest,
     DeepHealthResponse,
     ErrorEnvelope,
@@ -120,6 +123,26 @@ async def startup_event():
         logger.info("database_initialized")
     except Exception as exc:
         logger.warning("database_init_failed", error=str(exc))
+
+
+@app.on_event("shutdown")
+async def shutdown_event():
+    """Graceful shutdown: wait for in-flight jobs to complete (up to 10s)."""
+    logger.info("service_shutting_down", service=SERVICE_NAME)
+    queue = get_job_queue()
+    running_jobs = [
+        j for j in queue._jobs.values() if j.status == JobStatus.RUNNING
+    ]
+    if running_jobs:
+        logger.info("waiting_for_jobs", count=len(running_jobs))
+        for _ in range(20):  # 20 x 0.5s = 10s max wait
+            running = [
+                j for j in queue._jobs.values() if j.status == JobStatus.RUNNING
+            ]
+            if not running:
+                break
+            await asyncio.sleep(0.5)
+    logger.info("service_stopped", service=SERVICE_NAME)
 
 
 # --- Auth dependency ---
@@ -396,6 +419,58 @@ async def chat_completions(request_body: ChatCompletionRequest, request: Request
     return JSONResponse(status_code=status_code, content=payload)
 
 
+# --- Batch Inference Endpoint ---
+
+@app.post("/v1/batch", response_model=BatchResponse)
+async def batch_inference(request_body: BatchRequest, request: Request):
+    """Process multiple inference requests in parallel."""
+    request_id = getattr(request.state, "request_id", "")
+    start = time.time()
+
+    semaphore = asyncio.Semaphore(request_body.max_concurrency)
+    results = [None] * len(request_body.requests)
+
+    async def process_single(idx, single_request):
+        async with semaphore:
+            try:
+                loop = asyncio.get_event_loop()
+                outcome = await loop.run_in_executor(
+                    None,
+                    lambda: coordinator.ask(
+                        prompt=single_request.prompt,
+                        task_type=single_request.task_type,
+                        model=single_request.model,
+                        temperature=single_request.temperature,
+                        top_p=single_request.top_p,
+                        max_tokens=single_request.max_tokens,
+                        stream=False,
+                        system_prompt=single_request.system_prompt,
+                    ),
+                )
+                results[idx] = BatchResponseItem(
+                    index=idx,
+                    success=outcome.success,
+                    response=outcome.to_api_response(),
+                    error=outcome.error,
+                )
+            except Exception as exc:
+                results[idx] = BatchResponseItem(
+                    index=idx, success=False, error=str(exc),
+                )
+
+    tasks = [process_single(i, req) for i, req in enumerate(request_body.requests)]
+    await asyncio.gather(*tasks)
+
+    succeeded = sum(1 for r in results if r and r.success)
+    return BatchResponse(
+        total=len(results),
+        succeeded=succeeded,
+        failed=len(results) - succeeded,
+        results=results,
+        total_latency_seconds=round(time.time() - start, 4),
+    )
+
+
 # --- Job Queue Endpoints ---
 
 @app.post("/jobs/submit", response_model=JobSubmitResponse)
@@ -462,6 +537,23 @@ async def get_job_status(job_id: str):
     )
 
 
+@app.delete("/jobs/{job_id}")
+async def cancel_job(job_id: str):
+    """Cancel a pending or running job."""
+    queue = get_job_queue()
+    cancelled = queue.cancel_job(job_id)
+    if not cancelled:
+        return JSONResponse(
+            status_code=404,
+            content={
+                "error": {
+                    "message": f"Job {job_id} not found or not cancellable.",
+                }
+            },
+        )
+    return {"cancelled": True, "job_id": job_id}
+
+
 @app.get("/jobs")
 async def list_jobs(limit: int = 50):
     """List recent jobs."""
@@ -476,7 +568,7 @@ async def _process_job(job_id: str, request_body: JobSubmitRequest):
 
     try:
         loop = asyncio.get_event_loop()
-        outcome = await loop.run_in_executor(
+        coro = loop.run_in_executor(
             None,
             lambda: coordinator.ask(
                 prompt=request_body.prompt,
@@ -489,6 +581,18 @@ async def _process_job(job_id: str, request_body: JobSubmitRequest):
                 system_prompt=request_body.system_prompt,
             ),
         )
+
+        # Apply timeout if configured
+        timeout = settings.timeout_seconds
+        if timeout:
+            outcome = await asyncio.wait_for(coro, timeout=timeout)
+        else:
+            outcome = await coro
+
+        # Check if the job was cancelled while we were processing
+        job = queue.get_job(job_id)
+        if job and job.status == JobStatus.CANCELLED:
+            return
 
         if outcome.success:
             queue.update_job(
@@ -505,6 +609,13 @@ async def _process_job(job_id: str, request_body: JobSubmitRequest):
                 result=outcome.to_api_response(),
                 progress="Failed",
             )
+    except asyncio.TimeoutError:
+        queue.update_job(
+            job_id,
+            status=JobStatus.FAILED,
+            error=f"Job timed out after {settings.timeout_seconds}s",
+            progress="Timed out",
+        )
     except Exception as exc:
         queue.update_job(
             job_id,

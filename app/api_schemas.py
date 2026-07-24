@@ -110,6 +110,27 @@ class ErrorEnvelope(BaseModel):
     error: dict[str, Any]
 
 
+class BatchRequest(BaseModel):
+    """Batch inference request."""
+    requests: list[AskRequest]
+    max_concurrency: int = Field(default=5, ge=1, le=20, description="Max parallel requests")
+
+
+class BatchResponseItem(BaseModel):
+    index: int
+    success: bool
+    response: dict[str, Any] | None = None
+    error: str | None = None
+
+
+class BatchResponse(BaseModel):
+    total: int
+    succeeded: int
+    failed: int
+    results: list[BatchResponseItem]
+    total_latency_seconds: float
+
+
 class JobSubmitRequest(BaseModel):
     prompt: str
     task_type: str | None = None

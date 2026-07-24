@@ -41,11 +41,36 @@ TASK_TYPE_SELECTION_REASON = {
     "lightweight": "recommended lightweight fallback model from latest benchmark",
 }
 
-FALLBACK_CHAIN = [
+FALLBACK_CHAINS: dict[str, list[str]] = {
+    "general": [
+        RECOMMENDED_ROUTE_MAP["general_fallback"],
+        RECOMMENDED_ROUTE_MAP["lightweight_fallback"],
+        RECOMMENDED_ROUTE_MAP["fast"],
+    ],
+    "coding": [
+        RECOMMENDED_ROUTE_MAP["general_fallback"],
+        RECOMMENDED_ROUTE_MAP["lightweight_fallback"],
+        RECOMMENDED_ROUTE_MAP["fast"],
+    ],
+    "reasoning": [
+        RECOMMENDED_ROUTE_MAP["general_fallback"],
+        RECOMMENDED_ROUTE_MAP["lightweight_fallback"],
+    ],
+    "fast": [
+        RECOMMENDED_ROUTE_MAP["lightweight_fallback"],
+        RECOMMENDED_ROUTE_MAP["general_fallback"],
+    ],
+}
+
+# Default chain for task types not explicitly configured
+DEFAULT_FALLBACK_CHAIN = [
     RECOMMENDED_ROUTE_MAP["general_fallback"],
     RECOMMENDED_ROUTE_MAP["lightweight_fallback"],
     RECOMMENDED_ROUTE_MAP["fast"],
 ]
+
+# Keep backward compatibility:
+FALLBACK_CHAIN = DEFAULT_FALLBACK_CHAIN
 
 
 @dataclass(frozen=True)
@@ -156,10 +181,11 @@ def is_model_available(model_id: str) -> bool:
     return model_id in get_available_model_ids()
 
 
-def fallback_candidates_for(model_id: str) -> list[str]:
-    candidates = [candidate for candidate in FALLBACK_CHAIN if candidate != model_id]
-    if model_id == RECOMMENDED_ROUTE_MAP["general_fallback"]:
-        candidates.insert(0, RECOMMENDED_ROUTE_MAP["lightweight_fallback"])
+def fallback_candidates_for(model_id: str, task_type: str | None = None) -> list[str]:
+    """Get fallback candidates for a model, optionally filtered by task type."""
+    normalized = normalize_task_type(task_type) if task_type else "general"
+    chain = FALLBACK_CHAINS.get(normalized, DEFAULT_FALLBACK_CHAIN)
+    candidates = [c for c in chain if c != model_id]
     return candidates
 
 

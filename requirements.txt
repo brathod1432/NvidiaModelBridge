@@ -21,6 +21,8 @@ sse-starlette>=2.0.0
 
 # Caching
 cachetools>=5.5.0
+# Optional: Redis cache backend
+redis>=5.0
 
 # Structured logging
 structlog>=24.0.0

@@ -8,6 +8,12 @@ from enum import Enum
 from threading import Lock
 from typing import Any
 
+try:
+    from app.metrics import update_circuit_state
+    _HAS_METRICS = True
+except ImportError:
+    _HAS_METRICS = False
+
 
 class CircuitState(str, Enum):
     CLOSED = "closed"
@@ -56,6 +62,8 @@ class ModelCircuitBreaker:
                     self._state = CircuitState.HALF_OPEN
                     self._half_open_calls = 0
                     self._stats.state_changed_at = time.time()
+                    if _HAS_METRICS:
+                        update_circuit_state(self.model_id, "half_open")
             return self._state
 
     def is_available(self) -> bool:
@@ -78,6 +86,8 @@ class ModelCircuitBreaker:
             if self._state == CircuitState.HALF_OPEN:
                 self._state = CircuitState.CLOSED
                 self._stats.state_changed_at = time.time()
+                if _HAS_METRICS:
+                    update_circuit_state(self.model_id, self._state.value)
 
     def record_failure(self) -> None:
         """Record a failed request."""
@@ -89,9 +99,13 @@ class ModelCircuitBreaker:
             if self._state == CircuitState.HALF_OPEN:
                 self._state = CircuitState.OPEN
                 self._stats.state_changed_at = time.time()
+                if _HAS_METRICS:
+                    update_circuit_state(self.model_id, self._state.value)
             elif self._stats.consecutive_failures >= self.failure_threshold:
                 self._state = CircuitState.OPEN
                 self._stats.state_changed_at = time.time()
+                if _HAS_METRICS:
+                    update_circuit_state(self.model_id, self._state.value)
 
     def reset(self) -> None:
         """Reset the circuit breaker to closed state."""
@@ -99,6 +113,8 @@ class ModelCircuitBreaker:
             self._state = CircuitState.CLOSED
             self._stats = CircuitStats()
             self._half_open_calls = 0
+            if _HAS_METRICS:
+                update_circuit_state(self.model_id, "closed")
 
     def get_status(self) -> dict[str, Any]:
         """Return current circuit breaker status."""

@@ -16,6 +16,7 @@ class JobStatus(str, Enum):
     RUNNING = "running"
     COMPLETED = "completed"
     FAILED = "failed"
+    CANCELLED = "cancelled"
 
 
 @dataclass
@@ -30,6 +31,7 @@ class Job:
     result: dict[str, Any] | None = None
     error: str | None = None
     progress: str = ""
+    timeout_seconds: float | None = None
 
 
 class JobQueue:
@@ -43,7 +45,6 @@ class JobQueue:
 
     def create_job(self, request_data: dict[str, Any]) -> Job:
         """Create a new pending job."""
-        self._cleanup_expired()
         job = Job(
             id=str(uuid.uuid4()),
             status=JobStatus.PENDING,
@@ -51,6 +52,7 @@ class JobQueue:
             request_data=request_data,
         )
         with self._lock:
+            self._cleanup_expired_locked()
             if len(self._jobs) >= self._max_jobs:
                 self._evict_oldest()
             self._jobs[job.id] = job
@@ -78,7 +80,7 @@ class JobQueue:
                 job.status = status
                 if status == JobStatus.RUNNING:
                     job.started_at = time.time()
-                elif status in (JobStatus.COMPLETED, JobStatus.FAILED):
+                elif status in (JobStatus.COMPLETED, JobStatus.FAILED, JobStatus.CANCELLED):
                     job.completed_at = time.time()
             if result is not None:
                 job.result = result
@@ -95,6 +97,20 @@ class JobQueue:
                 self._jobs.values(), key=lambda j: j.created_at, reverse=True
             )[:limit]
         return [self._job_to_dict(job) for job in jobs]
+
+    def cancel_job(self, job_id: str) -> bool:
+        """Cancel a pending or running job.
+
+        Returns True if the job was successfully cancelled, False otherwise.
+        """
+        with self._lock:
+            job = self._jobs.get(job_id)
+            if job and job.status in (JobStatus.PENDING, JobStatus.RUNNING):
+                job.status = JobStatus.CANCELLED
+                job.completed_at = time.time()
+                job.error = "Job cancelled by user"
+                return True
+            return False
 
     def _job_to_dict(self, job: Job) -> dict[str, Any]:
         elapsed = None
@@ -114,22 +130,27 @@ class JobQueue:
         }
 
     def _cleanup_expired(self) -> None:
-        now = time.time()
+        """Cleanup expired jobs (acquires the lock)."""
         with self._lock:
-            expired = [
-                job_id
-                for job_id, job in self._jobs.items()
-                if now - job.created_at > self._job_ttl
-                and job.status in (JobStatus.COMPLETED, JobStatus.FAILED)
-            ]
-            for job_id in expired:
-                del self._jobs[job_id]
+            self._cleanup_expired_locked()
+
+    def _cleanup_expired_locked(self) -> None:
+        """Cleanup expired jobs (must be called with lock held)."""
+        now = time.time()
+        expired = [
+            job_id
+            for job_id, job in self._jobs.items()
+            if now - job.created_at > self._job_ttl
+            and job.status in (JobStatus.COMPLETED, JobStatus.FAILED, JobStatus.CANCELLED)
+        ]
+        for job_id in expired:
+            del self._jobs[job_id]
 
     def _evict_oldest(self) -> None:
         completed = [
             (job_id, job)
             for job_id, job in self._jobs.items()
-            if job.status in (JobStatus.COMPLETED, JobStatus.FAILED)
+            if job.status in (JobStatus.COMPLETED, JobStatus.FAILED, JobStatus.CANCELLED)
         ]
         if completed:
             oldest_id = min(completed, key=lambda x: x[1].created_at)[0]

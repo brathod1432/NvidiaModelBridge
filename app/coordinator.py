@@ -279,7 +279,7 @@ class Coordinator:
         primary_error: str,
     ) -> CoordinatorOutcome | None:
         """Try all available fallback candidates in order."""
-        candidates = fallback_candidates_for(selection.model_id)
+        candidates = fallback_candidates_for(selection.model_id, task_type=selection.task_type)
         for fallback_model_id in candidates:
             if not is_model_available(fallback_model_id):
                 continue

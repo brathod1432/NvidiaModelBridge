@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import logging
 import sqlite3
 import time
 from contextlib import contextmanager
@@ -11,10 +12,18 @@ from typing import Any, Generator
 
 from app.config import get_project_root
 
+logger = logging.getLogger(__name__)
+
 
 DB_PATH = get_project_root() / "data" / "nvidia_bridge.db"
 
 _SCHEMA = """
+CREATE TABLE IF NOT EXISTS schema_versions (
+    version INTEGER PRIMARY KEY,
+    applied_at REAL NOT NULL,
+    description TEXT DEFAULT ''
+);
+
 CREATE TABLE IF NOT EXISTS request_log (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     request_id TEXT NOT NULL,
@@ -74,6 +83,30 @@ CREATE INDEX IF NOT EXISTS idx_model_usage_timestamp ON model_usage(timestamp);
 CREATE INDEX IF NOT EXISTS idx_audit_runs_timestamp ON audit_runs(timestamp);
 """
 
+_MIGRATIONS = {
+    1: ("Initial schema", _SCHEMA),
+    2: ("Add job timeout tracking", """
+        ALTER TABLE request_log ADD COLUMN job_id TEXT DEFAULT '';
+    """),
+}
+
+
+def _get_current_version(conn: sqlite3.Connection) -> int:
+    try:
+        row = conn.execute("SELECT MAX(version) FROM schema_versions").fetchone()
+        return row[0] if row[0] is not None else 0
+    except sqlite3.OperationalError:
+        return 0
+
+
+def _apply_migration(conn: sqlite3.Connection, version: int, description: str, sql: str) -> None:
+    conn.executescript(sql)
+    conn.execute(
+        "INSERT INTO schema_versions (version, applied_at, description) VALUES (?, ?, ?)",
+        (version, time.time(), description),
+    )
+    conn.commit()
+
 
 def ensure_db_dir() -> None:
     """Ensure the database directory exists."""
@@ -95,10 +128,25 @@ def get_db_connection() -> Generator[sqlite3.Connection, None, None]:
 
 
 def init_database() -> None:
-    """Initialize the database schema."""
+    """Initialize the database schema and apply pending migrations."""
     with get_db_connection() as conn:
-        conn.executescript(_SCHEMA)
-        conn.commit()
+        current = _get_current_version(conn)
+        if current == 0:
+            conn.executescript(_SCHEMA)
+            conn.execute(
+                "INSERT INTO schema_versions (version, applied_at, description) VALUES (?, ?, ?)",
+                (1, time.time(), "Initial schema"),
+            )
+            conn.commit()
+            current = 1
+        for ver in sorted(_MIGRATIONS.keys()):
+            if ver > current:
+                desc, sql = _MIGRATIONS[ver]
+                try:
+                    _apply_migration(conn, ver, desc, sql)
+                    logger.info("migration_applied", extra={"version": ver, "description": desc})
+                except Exception as exc:
+                    logger.warning("migration_failed", extra={"version": ver, "error": str(exc)})
 
 
 def log_request(
